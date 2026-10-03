@@ -6,7 +6,9 @@ Or via pytest: python -m pytest tests/test_stt.py -q
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from stt import (
     _get_ark_api_key,
     _get_hermes_chat_context,
     _llm_postprocess,
+    _strip_hidden,
 )
 
 
@@ -39,6 +42,7 @@ def test_get_ark_api_key_from_env(monkeypatch=None):
 def test_default_prompt_integrity():
     assert "数字" in DEFAULT_LLM_SYSTEM_PROMPT
     assert "口吃" in DEFAULT_LLM_SYSTEM_PROMPT or "重复词" in DEFAULT_LLM_SYSTEM_PROMPT
+    assert "歧义" in DEFAULT_LLM_SYSTEM_PROMPT
 
 
 def test_llm_postprocess_empty():
@@ -65,6 +69,72 @@ def test_chat_context_safely_handles_missing_db():
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = orig
+
+
+def _make_db(rows):
+    """Create a throwaway state.db with given (session_id, role, content) rows."""
+    tmp = tempfile.mkdtemp()
+    db = Path(tmp) / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT)")
+    conn.executemany("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+    return tmp
+
+
+def _with_hermes_home(tmp, fn):
+    orig = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = tmp
+    try:
+        return fn()
+    finally:
+        if orig is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = orig
+
+
+def test_strip_hidden_elides_large_code_blocks_only():
+    small = "前文 ```x = 1``` 后文"
+    assert "x = 1" in _strip_hidden(small)  # short block kept verbatim
+    big = "前文 ```" + "a = 1\n" * 60 + "``` 后文TAIL"
+    out = _strip_hidden(big)
+    assert "omitted" in out and "前文" in out and "后文TAIL" in out
+    assert "a = 1" not in out
+
+
+def test_chat_context_adjacent_round_complete():
+    # A name deep inside a long user message must survive (no 120-char truncation),
+    # and only the adjacent round is injected — older rounds are not.
+    long_q = "开头" + "啊" * 200 + "中间提到杨奕旻这个名字" + "结尾" + "嗯" * 50
+    rows = [
+        ("s1", "user", "更早一轮的问题"),
+        ("s1", "assistant", "更早一轮的回复"),
+        ("s1", "user", long_q),
+        ("s1", "assistant", "这是紧随其后的完整回复"),
+    ]
+    out = _with_hermes_home(_make_db(rows), _get_hermes_chat_context)
+    assert "杨奕旻" in out
+    assert "这是紧随其后的完整回复" in out
+    assert "更早一轮" not in out
+
+
+def test_chat_context_user_alone_pairs_previous_reply():
+    rows = [
+        ("s1", "user", "上一轮问题"),
+        ("s1", "assistant", "上一轮回复"),
+        ("s1", "user", "刚说的话还没有回复"),
+    ]
+    out = _with_hermes_home(_make_db(rows), _get_hermes_chat_context)
+    assert "刚说的话还没有回复" in out
+    assert "上一轮回复" in out
+
+
+def test_chat_context_fallback_without_user_rows():
+    rows = [("s1", "assistant", "助手消息一"), ("s1", "assistant", "助手消息二")]
+    out = _with_hermes_home(_make_db(rows), _get_hermes_chat_context)
+    assert "助手消息一" in out and "助手消息二" in out
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ Once configured, Hermes uses Volcengine for all TTS and STT automatically:
 原生语音识别在口语交流中常遇到重复语气、口吃结巴，且对特定技术或专业术语缺乏语境判断。本插件支持可选的**三层智能后处理**：
 
 1. **原生流式 ASR**：由火山引擎 WebSocket API 极速转写；
-2. **会话语境感知**：自动读取 Hermes 本地会话最近讨论背景（无锁只读连接，耗时毫秒级），为大模型提供专业词汇先验；
+2. **会话语境感知**：自动读取当前会话**相邻一轮完整对话**（最近一条用户消息＋其后的全部可见回复，无锁只读、毫秒级；用户可见内容一字不删，工具调用/大段代码等不可见内容略去），为大模型提供完整语境与人名指代；
 3. **大模型平滑润色**：调用豆包轻量大模型（默认 `doubao-seed-2.1-lite`，关闭思考耗时仅 1~2s）抚平口吃、修正同音错字，同时严守忠实原意、不篡改数字与代码的红线。
 
 ### 配置与开启
@@ -97,7 +97,7 @@ stt:
   provider: volcengine
   volcengine:
     enable_llm_postprocess: true   # 检测到 Key 时默认开启，设为 false 可完全禁用
-    enable_context: true           # 是否读取当前会话最近消息作为词汇背景
+    enable_context: true           # 是否读取相邻一轮完整对话作为语境
     llm_model: doubao-seed-2.1-lite
     hotwords:                      # 可选自定义高频专有词
       - "变式"

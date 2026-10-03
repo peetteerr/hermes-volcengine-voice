@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import sqlite3
 import struct
@@ -186,7 +187,7 @@ DEFAULT_LLM_SYSTEM_PROMPT = (
     "你是一个高精度的语音识别（ASR）后处理专家。\n"
     "你的任务是根据当前会话语境，对语音转写的初步文本进行平滑润色与纠错：\n"
     "1. 抚平口吃、重复词与无意义语气助词（如\"然后然后\"、\"那个那个\"、\"就是就是\"），使表达通顺连贯。\n"
-    "2. 结合所提供的会话上下文（若有），纠正发音相近的同音错别字、专有名词与技术术语。\n"
+    "2. 结合所提供的会话上下文（若有），纠正发音相近的同音错别字、专有名词与技术术语；遇到人名/术语歧义（多个写法都像）时，必须按上下文语义裁决指的是谁，拿不准才保留原文。\n"
     "3. 严格忠实于说话人原意，严禁添枝加叶、虚构内容或擅自发散。\n"
     "4. 绝不修改任何数字、金额、分数、代码符号或专有缩写。\n"
     "5. 直接输出润色后的文本，绝不要输出任何解释说明、问答标签或前后缀。"
@@ -204,11 +205,25 @@ def _get_ark_api_key(vc_config: dict[str, Any]) -> str:
     )
 
 
-def _get_hermes_chat_context(max_items: int = 3, max_chars: int = 400) -> str:
-    """Read recent conversation turns from Hermes SQLite database (state.db).
+def _strip_hidden(text: str) -> str:
+    """Elide content the user never saw (large code blocks / tool output); keep the rest verbatim."""
 
-    Read-only, non-blocking (timeout=0.5s) extraction to help the LLM recognize
-    domain-specific terminology and context-sensitive homophones.
+    def repl(match: "re.Match[str]") -> str:
+        body = match.group(0)
+        return "\n……(code/tool content omitted)……\n" if len(body) > 200 else body
+
+    return re.sub(r"```.*?```", repl, text, flags=re.S)
+
+
+def _get_hermes_chat_context(max_chars: int = 8000) -> str:
+    """Read the adjacent conversation round from Hermes SQLite database (state.db).
+
+    The LLM corrects names/terms against the decision context the user actually
+    saw: the latest user message plus every visible assistant reply after it,
+    COMPLETE — no per-message truncation (a fixed 120-char prefix drops exactly
+    the names the correction depends on). Only content invisible to the user
+    (large code blocks / tool output) is elided. `max_chars` is a safety valve,
+    normally untouched. Read-only, non-blocking (timeout=0.5s).
     """
     candidates: list[Path] = []
     env_home = os.environ.get("HERMES_HOME")
@@ -243,26 +258,50 @@ def _get_hermes_chat_context(max_items: int = 3, max_chars: int = 400) -> str:
                 return ""
             latest_session_id = row[0]
 
+            # Adjacent round = latest user message (inclusive) + every visible
+            # reply after it, oldest first; fallbacks keep older sessions working.
             cursor.execute(
-                "SELECT role, content FROM messages "
-                "WHERE session_id = ? AND role IN ('user', 'assistant') AND content IS NOT NULL "
-                "ORDER BY id DESC LIMIT ?",
-                (latest_session_id, max_items),
+                "SELECT id, role, content FROM messages "
+                "WHERE session_id = ? AND role IN ('user', 'assistant') "
+                "AND content IS NOT NULL AND trim(content) != '' "
+                "AND id >= (SELECT MAX(id) FROM messages WHERE session_id = ? "
+                "AND role = 'user' AND content IS NOT NULL AND trim(content) != '') "
+                "ORDER BY id ASC LIMIT 12",
+                (latest_session_id, latest_session_id),
             )
-            rows = cursor.fetchall()
-            if not rows:
-                return ""
+            round_rows = cursor.fetchall()
+            if not round_rows:
+                cursor.execute(
+                    "SELECT id, role, content FROM messages "
+                    "WHERE session_id = ? AND role IN ('user', 'assistant') "
+                    "AND content IS NOT NULL AND trim(content) != '' "
+                    "ORDER BY id DESC LIMIT 2",
+                    (latest_session_id,),
+                )
+                round_rows = cursor.fetchall()[::-1]
+            elif len(round_rows) == 1:
+                # User message alone (no reply yet): pair it with the previous
+                # assistant reply so the model still sees one full round.
+                cursor.execute(
+                    "SELECT id, role, content FROM messages "
+                    "WHERE session_id = ? AND role = 'assistant' "
+                    "AND content IS NOT NULL AND trim(content) != '' AND id < ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (latest_session_id, round_rows[0][0]),
+                )
+                older = cursor.fetchone()
+                if older:
+                    round_rows = [older] + round_rows
 
             lines: list[str] = []
-            for role, content in reversed(rows):
-                text = (content or "").strip()
+            for _, role, content in round_rows:  # already oldest-first
+                text = _strip_hidden(" ".join((content or "").strip().split()))
                 if not text or text.startswith("<tool_call>") or text.startswith("::preview"):
                     continue
-                snippet = text[:120].replace("\n", " ")
-                lines.append(f"[{role}]: {snippet}")
+                lines.append(f"[{role}]: {text}")
 
             merged = "\n".join(lines)
-            return merged[:max_chars]
+            return merged[-max_chars:] if len(merged) > max_chars else merged
     except Exception as exc:
         logger.debug("Failed to read Hermes chat context: %s", exc)
         return ""
@@ -285,7 +324,7 @@ def _llm_postprocess(raw_text: str, vc_config: dict[str, Any], ark_key: str) -> 
     if vc_config.get("enable_context", True):
         context = _get_hermes_chat_context()
         if context:
-            system_prompt += f"\n\n当前会话上下文(最近讨论的话题背景,仅供理解专业术语,绝对不要把这部分内容混入输出):\n{context}"
+            system_prompt += f"\n\n当前会话上一轮完整对话(用户可见内容,仅供理解语境与人名指代,绝对不要把这部分内容混入输出):\n{context}"
 
     endpoint = vc_config.get(
         "ark_endpoint",

@@ -74,6 +74,39 @@ Once configured, Hermes uses Volcengine for all TTS and STT automatically:
 - **Voice responses** — spoken via Volcengine TTS when `/voice tts` is enabled
 - **Discord voice channels** — join with `/voice channel`, bot speaks through VC
 
+## 🧠 智能语音纠偏与会话感知 (Smart STT)
+
+原生语音识别在口语交流中常遇到重复语气、口吃结巴，且对特定技术或专业术语缺乏语境判断。本插件支持可选的**三层智能后处理**：
+
+1. **原生流式 ASR**：由火山引擎 WebSocket API 极速转写；
+2. **会话语境感知**：自动读取 Hermes 本地会话最近讨论背景（无锁只读连接，耗时毫秒级），为大模型提供专业词汇先验；
+3. **大模型平滑润色**：调用豆包轻量大模型（默认 `doubao-seed-2.1-lite`，关闭思考耗时仅 1~2s）抚平口吃、修正同音错字，同时严守忠实原意、不篡改数字与代码的红线。
+
+### 配置与开启
+
+在 `~/.hermes/.env` 中配置火山方舟 API Key（或 Coding API Key）：
+
+```bash
+echo 'VOLCENGINE_ARK_API_KEY=your-ark-api-key' >> ~/.hermes/.env
+```
+
+在 `config.yaml` 中可进行细粒度控制（全部可选，默认具备开箱即用的安全退回）：
+
+```yaml
+stt:
+  provider: volcengine
+  volcengine:
+    enable_llm_postprocess: true   # 检测到 Key 时默认开启，设为 false 可完全禁用
+    enable_context: true           # 是否读取当前会话最近消息作为词汇背景
+    llm_model: doubao-seed-2.1-lite
+    hotwords:                      # 可选自定义高频专有词
+      - "变式"
+      - "情境"
+      - "架构"
+```
+
+*注：若未配置 Ark Key 或大模型调用遇到网络异常，系统会自动平滑降级返回原生识别文本，绝不阻断正常使用。*
+
 ## 🎭 情绪指令（`[情绪] 文本`）
 
 > ✍️ **情绪指令功能由社区贡献者 [@BartmossW](https://github.com/BartmossW) 开发并提交（[PR #1](https://github.com/linxichen/hermes-volcengine-voice/pull/1)）**，感谢贡献！
